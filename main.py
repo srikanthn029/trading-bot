@@ -12,12 +12,19 @@ MAX_TRADES = 4
 active_trades = []
 balance = TOTAL_CAPITAL
 
+# ========= SELECTED COINS ONLY =========
+SYMBOLS = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
+    "AVAXUSDT","LINKUSDT","POLUSDT","DOGEUSDT","APTUSDT",
+    "SUIUSDT","NEARUSDT","ARBUSDT","OPUSDT","INJUSDT",
+    "RNDRUSDT","FETUSDT","SEIUSDT","KASUSDT","XLMUSDT"
+]
 
 # ========= TELEGRAM =========
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=5)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
@@ -26,90 +33,59 @@ def send_telegram(msg):
 def get_data(symbol):
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": "5m", "limit": 100}
+        params = {"symbol": symbol, "interval": "5m", "limit": 50}
 
-        res = requests.get(url, params=params, timeout=5)
-
-        if res.status_code != 200:
-            return None
-
-        data = res.json()
+        data = requests.get(url, params=params).json()
 
         if not isinstance(data, list) or len(data) == 0:
             return None
 
-        df = pd.DataFrame(data)
-
-        df.columns = [
+        df = pd.DataFrame(data, columns=[
             "time","o","h","l","c","v",
             "ct","q","n","taker_base","taker_quote","ignore"
-        ]
+        ])
 
-        for col in ["o","h","l","c"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna()
-
-        # 🔥 IMPORTANT SAFETY
-        if df.shape[0] < 10:
-            return None
-
+        df["c"] = pd.to_numeric(df["c"])
         return df
 
-    except Exception as e:
-        print("DATA ERROR:", e)
+    except:
         return None
 
 
-# ========= SCANNER =========
+# ========= IMPROVED MOMENTUM =========
 def scan_coins():
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "volume_desc",
-                "per_page": 50,
-                "price_change_percentage": "1h,24h"
-            },
-            timeout=5
-        )
+    results = []
 
-        if r.status_code != 200:
-            print("⚠️ API ERROR:", r.status_code)
-            return []
+    for symbol in SYMBOLS:
+        df = get_data(symbol)
 
-        data = r.json()
+        if df is None or len(df) < 20:
+            continue
 
-        # 🔥 CRITICAL FIX
-        if not isinstance(data, list):
-            print("⚠️ Rate limit / bad response:", data)
-            return []
+        try:
+            price_now = df["c"].iloc[-1]
+            price_5 = df["c"].iloc[-5]
+            price_15 = df["c"].iloc[-15]
 
-        coins = []
+            # short + medium momentum
+            change_5 = ((price_now - price_5) / price_5) * 100
+            change_15 = ((price_now - price_15) / price_15) * 100
 
-        for c in data:
-            if not isinstance(c, dict):
+            # combined score
+            score = abs(change_5) * 2 + abs(change_15)
+
+            # filter weak moves
+            if abs(change_5) < 0.3:
                 continue
 
-            price = c.get("current_price", 0)
-            vol = c.get("total_volume", 0)
-            c1h = c.get("price_change_percentage_1h_in_currency", 0)
+            results.append((symbol, score, change_5))
 
-            if price < 0.05 or vol < 5_000_000:
-                continue
+        except:
+            continue
 
-            score = abs(c1h) * 2 + abs(c.get("price_change_percentage_24h", 0))
+    results.sort(key=lambda x: x[1], reverse=True)
 
-            coins.append((c["symbol"].upper() + "USDT", score, c1h))
-
-        coins.sort(key=lambda x: x[1], reverse=True)
-
-        return coins[:10]
-
-    except Exception as e:
-        print("SCANNER ERROR:", e)
-        return []
+    return results[:5]
 
 
 # ========= ENTRY =========
@@ -137,7 +113,7 @@ Coin: {symbol}
 Entry: {round(price,4)}
 TP: {round(tp,4)}
 
-Trade Size: {trade_size}
+Size: {trade_size}
 Score: {round(score,2)}
 
 Balance: {round(balance,2)}
@@ -155,17 +131,11 @@ def check_trades():
     for trade in active_trades:
         df = get_data(trade["symbol"])
 
-        if df is None or len(df) == 0 or "c" not in df.columns:
-            print(f"⚠️ Skipping {trade['symbol']} (no data)")
+        if df is None or len(df) == 0:
             new_trades.append(trade)
             continue
 
-        try:
-            price = df["c"].iloc[-1]
-        except:
-            print(f"⚠️ Price error {trade['symbol']}")
-            new_trades.append(trade)
-            continue
+        price = df["c"].iloc[-1]
 
         entry = trade["entry"]
         tp = trade["tp"]
@@ -173,7 +143,7 @@ def check_trades():
 
         exit_hit = False
 
-        # ===== PROFIT =====
+        # PROFIT
         if trade["direction"] == "LONG" and price >= tp:
             pnl = 0.10
             exit_hit = True
@@ -182,7 +152,7 @@ def check_trades():
             pnl = 0.10
             exit_hit = True
 
-        # ===== STOP LOSS =====
+        # STOP LOSS
         elif trade["direction"] == "LONG" and price <= entry * 0.95:
             pnl = -0.50
             exit_hit = True
@@ -219,27 +189,21 @@ def run():
     coins = scan_coins()
 
     if not coins:
-        print("⚠️ No coins found")
+        print("⚠️ No strong momentum")
         return
 
     while len(active_trades) < MAX_TRADES:
-        for symbol, score, c1h in coins:
+        for symbol, score, change in coins:
 
             if symbol in [t["symbol"] for t in active_trades]:
                 continue
 
             df = get_data(symbol)
-
-            if df is None or len(df) == 0 or "c" not in df.columns:
-                print(f"⚠️ Skipping {symbol}")
+            if df is None:
                 continue
 
-            try:
-                price = df["c"].iloc[-1]
-            except:
-                continue
-
-            direction = "LONG" if c1h > 0 else "SHORT"
+            price = df["c"].iloc[-1]
+            direction = "LONG" if change > 0 else "SHORT"
 
             open_trade(symbol, direction, price, score)
             break
@@ -248,12 +212,12 @@ def run():
 
 
 # ========= LOOP =========
-print("🚀 BOT STARTED (FINAL STABLE VERSION)\n")
+print("🚀 BOT STARTED (PRO MODE)\n")
 
 while True:
     try:
         run()
-        time.sleep(20)
+        time.sleep(60)
     except Exception as e:
-        print("CRASH:", e)
+        print("ERROR:", e)
         time.sleep(10)
