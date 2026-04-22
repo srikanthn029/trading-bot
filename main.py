@@ -3,7 +3,7 @@ import requests
 import time
 
 # ========= CONFIG =========
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "8723933981:AAFJQV2G2kDGi4hzNJ5IB3VtNiMCyapGfvQ"
 CHAT_ID = "995122719"
 
 TOTAL_CAPITAL = 100000
@@ -48,7 +48,13 @@ def get_data(symbol):
         for col in ["o","h","l","c"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return df.dropna()
+        df = df.dropna()
+
+        # 🔥 IMPORTANT SAFETY
+        if df.shape[0] < 10:
+            return None
+
+        return df
 
     except Exception as e:
         print("DATA ERROR:", e)
@@ -70,12 +76,14 @@ def scan_coins():
         )
 
         if r.status_code != 200:
+            print("⚠️ API ERROR:", r.status_code)
             return []
 
         data = r.json()
 
+        # 🔥 CRITICAL FIX
         if not isinstance(data, list):
-            print("⚠️ Rate limit hit")
+            print("⚠️ Rate limit / bad response:", data)
             return []
 
         coins = []
@@ -129,7 +137,7 @@ Coin: {symbol}
 Entry: {round(price,4)}
 TP: {round(tp,4)}
 
-Size: {trade_size}
+Trade Size: {trade_size}
 Score: {round(score,2)}
 
 Balance: {round(balance,2)}
@@ -147,11 +155,17 @@ def check_trades():
     for trade in active_trades:
         df = get_data(trade["symbol"])
 
-        if df is None or df.empty:
+        if df is None or len(df) == 0 or "c" not in df.columns:
+            print(f"⚠️ Skipping {trade['symbol']} (no data)")
             new_trades.append(trade)
             continue
 
-        price = df["c"].iloc[-1]
+        try:
+            price = df["c"].iloc[-1]
+        except:
+            print(f"⚠️ Price error {trade['symbol']}")
+            new_trades.append(trade)
+            continue
 
         entry = trade["entry"]
         tp = trade["tp"]
@@ -159,6 +173,7 @@ def check_trades():
 
         exit_hit = False
 
+        # ===== PROFIT =====
         if trade["direction"] == "LONG" and price >= tp:
             pnl = 0.10
             exit_hit = True
@@ -167,6 +182,7 @@ def check_trades():
             pnl = 0.10
             exit_hit = True
 
+        # ===== STOP LOSS =====
         elif trade["direction"] == "LONG" and price <= entry * 0.95:
             pnl = -0.50
             exit_hit = True
@@ -214,10 +230,15 @@ def run():
 
             df = get_data(symbol)
 
-            if df is None or df.empty:
+            if df is None or len(df) == 0 or "c" not in df.columns:
+                print(f"⚠️ Skipping {symbol}")
                 continue
 
-            price = df["c"].iloc[-1]
+            try:
+                price = df["c"].iloc[-1]
+            except:
+                continue
+
             direction = "LONG" if c1h > 0 else "SHORT"
 
             open_trade(symbol, direction, price, score)
@@ -227,7 +248,7 @@ def run():
 
 
 # ========= LOOP =========
-print("🚀 BOT STARTED (STABLE MODE)\n")
+print("🚀 BOT STARTED (FINAL STABLE VERSION)\n")
 
 while True:
     try:
