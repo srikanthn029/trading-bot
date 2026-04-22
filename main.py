@@ -3,14 +3,12 @@ import requests
 import time
 
 # ========= CONFIG =========
-BOT_TOKEN = "8723933981:AAFJQV2G2kDGi4hzNJ5IB3VtNiMCyapGfvQ"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID = "995122719"
 
 TOTAL_CAPITAL = 100000
-LEVERAGE = 10
 MAX_TRADES = 4
 
-# ========= STATE =========
 active_trades = []
 balance = TOTAL_CAPITAL
 
@@ -24,31 +22,36 @@ def send_telegram(msg):
         pass
 
 
-# ========= DATA (FIXED - NO BINANCE CLIENT) =========
+# ========= DATA =========
 def get_data(symbol):
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {
-            "symbol": symbol,
-            "interval": "5m",
-            "limit": 100
-        }
+        params = {"symbol": symbol, "interval": "5m", "limit": 100}
 
         res = requests.get(url, params=params, timeout=5)
+
+        if res.status_code != 200:
+            return None
+
         data = res.json()
 
-        df = pd.DataFrame(data, columns=[
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+
+        df = pd.DataFrame(data)
+
+        df.columns = [
             "time","o","h","l","c","v",
             "ct","q","n","taker_base","taker_quote","ignore"
-        ])
+        ]
 
         for col in ["o","h","l","c"]:
-            df[col] = df[col].astype(float)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return df
+        return df.dropna()
 
     except Exception as e:
-        print(f"Data error for {symbol}:", e)
+        print("DATA ERROR:", e)
         return None
 
 
@@ -66,15 +69,25 @@ def scan_coins():
             timeout=5
         )
 
+        if r.status_code != 200:
+            return []
+
         data = r.json()
+
+        if not isinstance(data, list):
+            print("⚠️ Rate limit hit")
+            return []
+
         coins = []
 
         for c in data:
+            if not isinstance(c, dict):
+                continue
+
             price = c.get("current_price", 0)
             vol = c.get("total_volume", 0)
             c1h = c.get("price_change_percentage_1h_in_currency", 0)
 
-            # FILTER BAD COINS
             if price < 0.05 or vol < 5_000_000:
                 continue
 
@@ -87,7 +100,7 @@ def scan_coins():
         return coins[:10]
 
     except Exception as e:
-        print("Scanner error:", e)
+        print("SCANNER ERROR:", e)
         return []
 
 
@@ -95,12 +108,9 @@ def scan_coins():
 def open_trade(symbol, direction, price, score):
     global balance
 
-    trade_size = round(balance / 4, 2)  # ✅ COMPOUNDING
+    trade_size = round(balance / 4, 2)
 
-    if direction == "LONG":
-        tp = price * 1.01
-    else:
-        tp = price * 0.99
+    tp = price * 1.01 if direction == "LONG" else price * 0.99
 
     trade = {
         "symbol": symbol,
@@ -116,15 +126,12 @@ def open_trade(symbol, direction, price, score):
 📢 ENTRY {direction}
 
 Coin: {symbol}
-
 Entry: {round(price,4)}
 TP: {round(tp,4)}
 
-Trade Size: {trade_size}
-
+Size: {trade_size}
 Score: {round(score,2)}
 
-Active Trades: {len(active_trades)}/4
 Balance: {round(balance,2)}
 """
     print(msg)
@@ -140,7 +147,7 @@ def check_trades():
     for trade in active_trades:
         df = get_data(trade["symbol"])
 
-        if df is None:
+        if df is None or df.empty:
             new_trades.append(trade)
             continue
 
@@ -148,11 +155,10 @@ def check_trades():
 
         entry = trade["entry"]
         tp = trade["tp"]
-        trade_size = trade["size"]
+        size = trade["size"]
 
         exit_hit = False
 
-        # ===== PROFIT =====
         if trade["direction"] == "LONG" and price >= tp:
             pnl = 0.10
             exit_hit = True
@@ -161,7 +167,6 @@ def check_trades():
             pnl = 0.10
             exit_hit = True
 
-        # ===== STOP LOSS =====
         elif trade["direction"] == "LONG" and price <= entry * 0.95:
             pnl = -0.50
             exit_hit = True
@@ -171,22 +176,20 @@ def check_trades():
             exit_hit = True
 
         if exit_hit:
-            profit = trade_size * pnl
+            profit = size * pnl
             balance += profit
 
             msg = f"""
 ✅ EXIT {trade['direction']}
 Coin: {trade['symbol']}
 
-Trade Size: {trade_size}
 PnL: {round(pnl*100,2)}%
 Profit: {round(profit,2)}
 
-💰 Total Balance: {round(balance,2)}
+💰 Balance: {round(balance,2)}
 """
             print(msg)
             send_telegram(msg)
-
         else:
             new_trades.append(trade)
 
@@ -195,19 +198,23 @@ Profit: {round(profit,2)}
 
 # ========= MAIN =========
 def run():
-    global active_trades
-
     check_trades()
 
-    while len(active_trades) < MAX_TRADES:
-        coins = scan_coins()
+    coins = scan_coins()
 
+    if not coins:
+        print("⚠️ No coins found")
+        return
+
+    while len(active_trades) < MAX_TRADES:
         for symbol, score, c1h in coins:
+
             if symbol in [t["symbol"] for t in active_trades]:
                 continue
 
             df = get_data(symbol)
-            if df is None:
+
+            if df is None or df.empty:
                 continue
 
             price = df["c"].iloc[-1]
@@ -220,12 +227,12 @@ def run():
 
 
 # ========= LOOP =========
-print("🚀 BOT STARTED (CLOUD MODE)\n")
+print("🚀 BOT STARTED (STABLE MODE)\n")
 
 while True:
     try:
         run()
-        time.sleep(15)
+        time.sleep(20)
     except Exception as e:
-        print("Error:", e)
-        time.sleep(5)
+        print("CRASH:", e)
+        time.sleep(10)
