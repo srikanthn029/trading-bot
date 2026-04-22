@@ -8,11 +8,13 @@ CHAT_ID = "995122719"
 
 TOTAL_CAPITAL = 100000
 MAX_TRADES = 4
+SCAN_INTERVAL = 180  # 3 min (safe)
 
-active_trades = []
+# ========= STATE =========
 balance = TOTAL_CAPITAL
+active_trades = []
 
-# ========= SELECTED COINS ONLY =========
+# ========= COINS =========
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
     "AVAXUSDT","LINKUSDT","POLUSDT","DOGEUSDT","APTUSDT",
@@ -21,23 +23,31 @@ SYMBOLS = [
 ]
 
 # ========= TELEGRAM =========
-def send_telegram(msg):
+def send(msg):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
     except:
         pass
-
 
 # ========= DATA =========
 def get_data(symbol):
     try:
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": "5m", "limit": 50}
+        res = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": symbol, "interval": "5m", "limit": 50},
+            timeout=5
+        )
 
-        data = requests.get(url, params=params).json()
+        if res.status_code != 200:
+            return None
 
-        if not isinstance(data, list) or len(data) == 0:
+        data = res.json()
+
+        if not isinstance(data, list) or len(data) < 20:
             return None
 
         df = pd.DataFrame(data, columns=[
@@ -51,48 +61,38 @@ def get_data(symbol):
     except:
         return None
 
+# ========= SMART SCANNER =========
+def scan_best_coin():
+    best = None
 
-# ========= IMPROVED MOMENTUM =========
-def scan_coins():
-    results = []
-
-    for symbol in SYMBOLS:
+    for symbol in SYMBOLS[:10]:  # limit API load
         df = get_data(symbol)
-
-        if df is None or len(df) < 20:
+        if df is None:
             continue
 
         try:
-            price_now = df["c"].iloc[-1]
-            price_5 = df["c"].iloc[-5]
-            price_15 = df["c"].iloc[-15]
+            p_now = df["c"].iloc[-1]
+            p_5 = df["c"].iloc[-5]
+            p_15 = df["c"].iloc[-15]
 
-            # short + medium momentum
-            change_5 = ((price_now - price_5) / price_5) * 100
-            change_15 = ((price_now - price_15) / price_15) * 100
+            move_short = (p_now - p_5) / p_5 * 100
+            move_mid = (p_now - p_15) / p_15 * 100
 
-            # combined score
-            score = abs(change_5) * 2 + abs(change_15)
+            score = abs(move_short) * 2 + abs(move_mid)
 
-            # filter weak moves
-            if abs(change_5) < 0.3:
-                continue
-
-            results.append((symbol, score, change_5))
+            if best is None or score > best[1]:
+                best = (symbol, score, move_short)
 
         except:
             continue
 
-    results.sort(key=lambda x: x[1], reverse=True)
-
-    return results[:5]
-
+    return best
 
 # ========= ENTRY =========
 def open_trade(symbol, direction, price, score):
     global balance
 
-    trade_size = round(balance / 4, 2)
+    size = round(balance / 4, 2)
 
     tp = price * 1.01 if direction == "LONG" else price * 0.99
 
@@ -101,7 +101,7 @@ def open_trade(symbol, direction, price, score):
         "direction": direction,
         "entry": price,
         "tp": tp,
-        "size": trade_size
+        "size": size
     }
 
     active_trades.append(trade)
@@ -109,115 +109,115 @@ def open_trade(symbol, direction, price, score):
     msg = f"""
 📢 ENTRY {direction}
 
-Coin: {symbol}
+{symbol}
 Entry: {round(price,4)}
 TP: {round(tp,4)}
 
-Size: {trade_size}
+Size: {size}
 Score: {round(score,2)}
 
 Balance: {round(balance,2)}
 """
     print(msg)
-    send_telegram(msg)
-
+    send(msg)
 
 # ========= EXIT =========
-def check_trades():
-    global active_trades, balance
+def manage_trades():
+    global balance, active_trades
 
-    new_trades = []
+    updated = []
 
-    for trade in active_trades:
-        df = get_data(trade["symbol"])
-
-        if df is None or len(df) == 0:
-            new_trades.append(trade)
+    for t in active_trades:
+        df = get_data(t["symbol"])
+        if df is None:
+            updated.append(t)
             continue
 
         price = df["c"].iloc[-1]
 
-        entry = trade["entry"]
-        tp = trade["tp"]
-        size = trade["size"]
+        entry = t["entry"]
+        size = t["size"]
 
-        exit_hit = False
+        exit_trade = False
 
-        # PROFIT
-        if trade["direction"] == "LONG" and price >= tp:
+        # TP
+        if t["direction"] == "LONG" and price >= t["tp"]:
             pnl = 0.10
-            exit_hit = True
+            exit_trade = True
 
-        elif trade["direction"] == "SHORT" and price <= tp:
+        elif t["direction"] == "SHORT" and price <= t["tp"]:
             pnl = 0.10
-            exit_hit = True
+            exit_trade = True
 
-        # STOP LOSS
-        elif trade["direction"] == "LONG" and price <= entry * 0.95:
+        # SL
+        elif t["direction"] == "LONG" and price <= entry * 0.95:
             pnl = -0.50
-            exit_hit = True
+            exit_trade = True
 
-        elif trade["direction"] == "SHORT" and price >= entry * 1.05:
+        elif t["direction"] == "SHORT" and price >= entry * 1.05:
             pnl = -0.50
-            exit_hit = True
+            exit_trade = True
 
-        if exit_hit:
+        if exit_trade:
             profit = size * pnl
             balance += profit
 
             msg = f"""
-✅ EXIT {trade['direction']}
-Coin: {trade['symbol']}
+✅ EXIT {t['direction']}
 
+{t['symbol']}
 PnL: {round(pnl*100,2)}%
 Profit: {round(profit,2)}
 
-💰 Balance: {round(balance,2)}
+Balance: {round(balance,2)}
 """
             print(msg)
-            send_telegram(msg)
+            send(msg)
         else:
-            new_trades.append(trade)
+            updated.append(t)
 
-    active_trades = new_trades
-
+    active_trades = updated
 
 # ========= MAIN =========
-def run():
-    check_trades()
+def run_cycle():
+    manage_trades()
 
-    coins = scan_coins()
-
-    if not coins:
-        print("⚠️ No strong momentum")
+    if len(active_trades) >= MAX_TRADES:
         return
 
-    while len(active_trades) < MAX_TRADES:
-        for symbol, score, change in coins:
+    best = scan_best_coin()
 
-            if symbol in [t["symbol"] for t in active_trades]:
-                continue
+    if not best:
+        print("No valid data this cycle")
+        return
 
-            df = get_data(symbol)
-            if df is None:
-                continue
+    symbol, score, move = best
 
-            price = df["c"].iloc[-1]
-            direction = "LONG" if change > 0 else "SHORT"
+    # minimum movement filter (very light)
+    if abs(move) < 0.1:
+        print(f"{symbol} weak move ({round(move,2)}%)")
+        return
 
-            open_trade(symbol, direction, price, score)
-            break
-        else:
-            break
+    # avoid duplicate
+    if symbol in [t["symbol"] for t in active_trades]:
+        return
 
+    df = get_data(symbol)
+    if df is None:
+        return
+
+    price = df["c"].iloc[-1]
+    direction = "LONG" if move > 0 else "SHORT"
+
+    open_trade(symbol, direction, price, score)
 
 # ========= LOOP =========
-print("🚀 BOT STARTED (PRO MODE)\n")
+print("🚀 HIGH QUALITY BOT STARTED\n")
 
 while True:
     try:
-        run()
-        time.sleep(60)
+        run_cycle()
+        time.sleep(SCAN_INTERVAL)
     except Exception as e:
         print("ERROR:", e)
         time.sleep(10)
